@@ -1,0 +1,300 @@
+import numpy as np
+import math
+import matplotlib.pyplot as plt
+import networkx as nx
+from random import randint
+
+# ==== CONFIGURATION ====
+n = 1000
+LOW = 1 / 10000
+HIGH = 1 / 100
+SEED = 42  # Set your random seed here for reproducibility
+
+# ==== Generate spiked distribution (controlled imbalance) ====
+def generate_spiked_distribution(n, num_spikes=20, spike_weight=0.04):
+    base_weight = (1.0 - num_spikes * spike_weight) / (n + 1 - num_spikes)
+    weights = np.full(n + 1, base_weight)
+    spike_indices = np.random.choice(n + 1, size=num_spikes, replace=False)
+    
+    for idx in spike_indices:
+        weights[idx] = spike_weight
+    
+    return weights / np.sum(weights)
+
+# ==== Recursive binomial segmentation ====
+def compute_segment_levels_recursive_safe(weights, max_level):
+    levels = [0] * len(weights)
+    indices = list(range(len(weights)))
+    
+    def segment_recursive(indices, weights, h):
+        if h == 0 or not indices:
+            return
+        
+        m = len(indices)
+        total_weight = sum(weights[i] for i in indices)
+        
+        b = h
+        while math.comb(b, h) < m:
+            b += 1
+            
+        try:
+            remainder = math.comb(b - 1, h)
+            c = m - remainder
+            base = math.comb(b - 2, h - 1)
+            max_seg = math.comb(b - 1, h - 1)
+        except ValueError:
+            return
+            
+        seg_size = min(base + c, max_seg)
+        target_weight = (seg_size / m) * total_weight
+        
+        acc_weight = 0
+        best_diff = float("inf")
+        best_idx = 0
+        
+        for i in range(m):
+            acc_weight += weights[indices[i]]
+            diff = abs(acc_weight - target_weight)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = i
+                
+        promoted_idx = indices[best_idx]
+        levels[promoted_idx] = max(levels[promoted_idx], h)
+        
+        segment_recursive(indices[:best_idx + 1], weights, h - 1)
+        segment_recursive(indices[best_idx + 1:], weights, h)
+    
+    segment_recursive(indices, weights, max_level)
+    
+    for i in range(len(levels)):
+        levels[i] = max(levels[i], 0)
+        
+    return levels
+
+# ==== Helper Functions for Optimal Skip List ====
+def my_range(start, end, B, h):
+    while start < end:
+        yield start
+        start = B[h][start][end]
+
+def compute_level(h, i, j, level, B):
+    for a in my_range(i, j, B, h):
+        b = B[h][a][j]
+        level[b - 1] = h - 1
+        if b > a + 1:
+            compute_level(h - 1, a, b - 1, level, B)
+
+# ==== Compute Optimal Skip List Structure ====
+def compute_optimal_fixed(p, n, level, cost_list, h_list):
+    rows, cols = n + 1, n + 1
+    w = [[0.0 for _ in range(cols)] for _ in range(rows)]
+    
+    for i in range(n + 1):
+        for j in range(i, n + 1):
+            w[i][j] = sum(p[i:j + 1])
+            
+    D1 = [[0.0 for _ in range(cols)] for _ in range(rows)]
+    D2 = [[0.0 for _ in range(cols)] for _ in range(rows)]
+    
+    for i in range(n):
+        D1[i][i + 1] = D2[i][i + 1] = p[i + 1]
+    D1[n][n] = D2[n][n] = 0
+    
+    for i in range(n):
+        for j in range(i + 2, n + 1):
+            D2[i][j] = D2[i][j - 1] + p[j] * (j - i)
+            
+    delta, delta_prev = D1, D2
+    min_cost = delta_prev[0][n] + 1
+    cost_list.append(min_cost)
+    h_list.append(1)
+    
+    logmax = min(20, n)
+    B = [[[0 for _ in range(rows)] for _ in range(cols)] for _ in range(logmax)]
+    
+    for h in range(1, logmax):
+        for i in range(n):
+            B[h][i][i + 1] = i + 1
+            
+    for i in range(n):
+        for j in range(i + 1, n + 1):
+            B[1][i][j] = i + 1
+            
+    h = h1 = 2
+    while h < logmax:
+        for i in range(n + 1):
+            k = n - i
+            for j in range(k + 2, n + 1):
+                dmin = float('inf')
+                umin = k + 1
+                
+                if B[h][k][j - 1] < len(B[h]) and B[h][k + 1][j] < len(B[h]):
+                    for u in range(B[h][k][j - 1], min(B[h][k + 1][j] + 1, n)):
+                        val = delta_prev[k][u - 1] + delta[u][j] + w[u][j]
+                        if val <= dmin:
+                            dmin = val
+                            umin = u
+                            
+                delta[k][j] = dmin
+                B[h][k][j] = umin
+                
+        val = delta[0][n] + h
+        cost_list.append(val)
+        h_list.append(h)
+        
+        if val < min_cost:
+            delta, delta_prev = delta_prev, delta
+            min_cost = val
+            h1 = h + 1
+            
+        h += 1
+        
+    compute_level(h1, 0, n, level, B)
+    
+    for i in range(n):
+        level[i] = max(level[i], 0)
+
+# ==== Skip List Classes ====
+class Node:
+    def __init__(self, key, level):
+        self.key = key
+        self.forward = [None] * (level + 1)
+
+class SkipList:
+    def __init__(self, max_lvl):
+        self.MAXLVL = max_lvl
+        self.header = self.createNode(self.MAXLVL, -1)
+        self.level = 0
+        
+    def createNode(self, lvl, key):
+        return Node(key, lvl)
+        
+    def insertElement(self, key, levelarr, elem):
+        update = [None] * (self.MAXLVL + 1)
+        current = self.header
+        
+        for i in range(self.level, -1, -1):
+            while current.forward[i] and current.forward[i].key < key:
+                current = current.forward[i]
+            update[i] = current
+            
+        current = current.forward[0]
+        
+        if current is None or current.key != key:
+            r = elem.index(key)
+            rlevel = levelarr[r]
+            
+            if rlevel > self.level:
+                for i in range(self.level + 1, rlevel + 1):
+                    update[i] = self.header
+                self.level = rlevel
+                
+            n = self.createNode(rlevel, key)
+            
+            for i in range(rlevel + 1):
+                n.forward[i] = update[i].forward[i]
+                update[i].forward[i] = n
+
+# ==== Search cost calculation ====
+def corrected_search_cost_full(skiplist, elements, weights):
+    total_weighted_cost = 0
+    horizontal_cost = 0
+    
+    for key in elements:
+        current = skiplist.header
+        cost = 0
+        horz = 0
+        
+        for level in range(skiplist.level, -1, -1):
+            while current.forward[level] and current.forward[level].key < key:
+                current = current.forward[level]
+                horz += 1
+            cost += 1
+            
+        cost += 1
+        total_weighted_cost += (cost - 1) * weights[key]
+        horizontal_cost += horz * weights[key]
+        
+    return total_weighted_cost / sum(weights), horizontal_cost / sum(weights)
+
+# ==== Visualization Function ====
+def draw_skiplist_graph(skiplist, level_arr, elem_list, title):
+    G = nx.DiGraph()
+    pos = {}
+    
+    current = skiplist.header.forward[0]
+    x_pos = 0
+    
+    while current:
+        idx = elem_list.index(current.key)
+        G.add_node(current.key, level=level_arr[idx])
+        pos[current.key] = (x_pos, -level_arr[idx])
+        
+        for i in range(len(current.forward)):
+            if current.forward[i] is not None:
+                G.add_edge(current.key, current.forward[i].key, level=i)
+                
+        current = current.forward[0]
+        x_pos += 1
+        
+    plt.figure(figsize=(20, 10))
+    edges = G.edges(data=True)
+    nx.draw(G, pos, with_labels=False, node_size=20, edge_color='gray', alpha=0.7)
+    
+    edge_labels = {(u, v): f"L{d['level']}" for u, v, d in edges}
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=5)
+    
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+# ==== Main Execution ====
+if __name__ == '__main__':
+    np.random.seed(SEED)
+    p = generate_spiked_distribution(n)
+    elements = list(range(n))
+    
+    # True optimal skip list
+    level_opt = [0] * (n + 1)
+    compute_optimal_fixed(p, n, level_opt, [], [])
+    
+    skiplist_opt = SkipList(max(level_opt))
+    for i in elements:
+        skiplist_opt.insertElement(i, level_opt, elements)
+        
+    avg_cost_opt, horz_cost_opt = corrected_search_cost_full(skiplist_opt, elements, p[:n])
+    entropy = -np.sum(p[:n] * np.log2(p[:n]))
+    
+    print(f"\n Entropy: {entropy:.4f} bits")
+    print(f" True Optimal Avg Cost: {avg_cost_opt:.4f} | Horizontal: {horz_cost_opt:.4f}")
+    
+    draw_skiplist_graph(
+        skiplist_opt, 
+        level_opt[:n], 
+        elements, 
+        f" True Optimal Skip List (Avg = {avg_cost_opt:.2f})"
+    )
+    
+    # Segmented skip lists with adjusted levels
+    for L in [max(level_opt), max(level_opt) + 1, max(level_opt) + 2]:
+        level_seg = compute_segment_levels_recursive_safe(p[:n], L)
+        
+        # Adjust by reducing each nonzero level by 1
+        adjusted_levels = [max(0, lvl - 1) if lvl > 0 else 0 for lvl in level_seg]
+        
+        skiplist_seg = SkipList(max(adjusted_levels))
+        for i in elements:
+            skiplist_seg.insertElement(i, adjusted_levels, elements)
+            
+        avg_cost_seg, horz_cost_seg = corrected_search_cost_full(skiplist_seg, elements, p[:n])
+        
+        print(f" Segmented (L={L}) Adjusted Avg Cost: {avg_cost_seg:.4f} | Horizontal: {horz_cost_seg:.4f}")
+        
+        draw_skiplist_graph(
+            skiplist_seg,
+            adjusted_levels,
+            elements,
+            f" Segmented Skip List (L={L}, Avg = {avg_cost_seg:.2f})"
+        )
